@@ -4,7 +4,7 @@ CHANGES
 1.0.8 (unreleased)
 ==================
 
-- Nothing changed yet.
+- Update to 1.0.8 and include the source map file.
 
 
 1.0.7-1 (2013-03-13)
