@@ -1,53 +1,33 @@
-/*! Raven.js 1.1.1 (a46fb67) | github.com/getsentry/raven-js */
+/*! Raven.js 1.1.19 (82b9c07) | github.com/getsentry/raven-js */
 
 /*
  * Includes TraceKit
  * https://github.com/getsentry/TraceKit
  *
- * Copyright 2013 Matt Robenolt and other contributors
+ * Copyright 2015 Matt Robenolt and other contributors
  * Released under the BSD license
  * https://github.com/getsentry/raven-js/blob/master/LICENSE
  *
  */
+;(function(window, undefined){
+'use strict';
+
 /*
  TraceKit - Cross brower stack traces - github.com/occ/TraceKit
  MIT license
 */
 
-;(function(window, undefined) {
-
-
-var TraceKit = {};
-var _oldTraceKit = window.TraceKit;
+var TraceKit = {
+    remoteFetching: false,
+    collectWindowErrors: true,
+    // 3 lines before, the offending line, 3 lines after
+    linesOfContext: 7
+};
 
 // global reference to slice
 var _slice = [].slice;
 var UNKNOWN_FUNCTION = '?';
 
-
-/**
- * _has, a better form of hasOwnProperty
- * Example: _has(MainHostObject, property) === true/false
- *
- * @param {Object} host object to check property
- * @param {string} key to check
- */
-function _has(object, key) {
-    return Object.prototype.hasOwnProperty.call(object, key);
-}
-
-function _isUndefined(what) {
-    return typeof what === 'undefined';
-}
-
-/**
- * TraceKit.noConflict: Export TraceKit out to another variable
- * Example: var TK = TraceKit.noConflict()
- */
-TraceKit.noConflict = function noConflict() {
-    window.TraceKit = _oldTraceKit;
-    return TraceKit;
-};
 
 /**
  * TraceKit.wrap: Wrap any function in a TraceKit reporter
@@ -109,6 +89,7 @@ TraceKit.wrap = function traceKitWrapper(func) {
  */
 TraceKit.report = (function reportModuleWrapper() {
     var handlers = [],
+        lastArgs = null,
         lastException = null,
         lastExceptionStack = null;
 
@@ -134,16 +115,24 @@ TraceKit.report = (function reportModuleWrapper() {
     }
 
     /**
+     * Remove all crash handlers.
+     */
+    function unsubscribeAll() {
+        uninstallGlobalHandler();
+        handlers = [];
+    }
+
+    /**
      * Dispatch stack information to all handlers.
      * @param {Object.<string, *>} stack
      */
-    function notifyHandlers(stack, windowError) {
+    function notifyHandlers(stack, isWindowError) {
         var exception = null;
-        if (windowError && !TraceKit.collectWindowErrors) {
+        if (isWindowError && !TraceKit.collectWindowErrors) {
           return;
         }
         for (var i in handlers) {
-            if (_has(handlers, i)) {
+            if (hasKey(handlers, i)) {
                 try {
                     handlers[i].apply(null, [stack].concat(_slice.call(arguments, 2)));
                 } catch (inner) {
@@ -166,32 +155,37 @@ TraceKit.report = (function reportModuleWrapper() {
      * @param {string} url URL of script that generated the exception.
      * @param {(number|string)} lineNo The line number at which the error
      * occurred.
+     * @param {?(number|string)} colNo The column number at which the error
+     * occurred.
+     * @param {?Error} ex The actual Error object.
      */
-    function traceKitWindowOnError(message, url, lineNo) {
+    function traceKitWindowOnError(message, url, lineNo, colNo, ex) {
         var stack = null;
 
         if (lastExceptionStack) {
             TraceKit.computeStackTrace.augmentStackTraceWithInitialElement(lastExceptionStack, url, lineNo, message);
-            stack = lastExceptionStack;
-            lastExceptionStack = null;
-            lastException = null;
+            processLastException();
+        } else if (ex) {
+            // New chrome and blink send along a real error object
+            // Let's just report that like a normal error.
+            // See: https://mikewest.org/2013/08/debugging-runtime-errors-with-window-onerror
+            stack = TraceKit.computeStackTrace(ex);
+            notifyHandlers(stack, true);
         } else {
             var location = {
                 'url': url,
-                'line': lineNo
+                'line': lineNo,
+                'column': colNo
             };
             location.func = TraceKit.computeStackTrace.guessFunctionName(location.url, location.line);
             location.context = TraceKit.computeStackTrace.gatherContext(location.url, location.line);
             stack = {
-                'mode': 'onerror',
                 'message': message,
                 'url': document.location.href,
-                'stack': [location],
-                'useragent': navigator.userAgent
+                'stack': [location]
             };
+            notifyHandlers(stack, true);
         }
-
-        notifyHandlers(stack, 'from window.onerror');
 
         if (_oldOnerrorHandler) {
             return _oldOnerrorHandler.apply(this, arguments);
@@ -202,7 +196,7 @@ TraceKit.report = (function reportModuleWrapper() {
 
     function installGlobalHandler ()
     {
-        if (_onErrorHandlerInstalled === true) {
+        if (_onErrorHandlerInstalled) {
             return;
         }
         _oldOnerrorHandler = window.onerror;
@@ -210,26 +204,46 @@ TraceKit.report = (function reportModuleWrapper() {
         _onErrorHandlerInstalled = true;
     }
 
+    function uninstallGlobalHandler ()
+    {
+        if (!_onErrorHandlerInstalled) {
+            return;
+        }
+        window.onerror = _oldOnerrorHandler;
+        _onErrorHandlerInstalled = false;
+        _oldOnerrorHandler = undefined;
+    }
+
+    function processLastException() {
+        var _lastExceptionStack = lastExceptionStack,
+            _lastArgs = lastArgs;
+        lastArgs = null;
+        lastExceptionStack = null;
+        lastException = null;
+        notifyHandlers.apply(null, [_lastExceptionStack, false].concat(_lastArgs));
+    }
+
     /**
      * Reports an unhandled Error to TraceKit.
      * @param {Error} ex
+     * @param {?boolean} rethrow If false, do not re-throw the exception.
+     * Only used for window.onerror to not cause an infinite loop of
+     * rethrowing.
      */
-    function report(ex) {
+    function report(ex, rethrow) {
         var args = _slice.call(arguments, 1);
         if (lastExceptionStack) {
             if (lastException === ex) {
                 return; // already caught by an inner catch block, ignore
             } else {
-                var s = lastExceptionStack;
-                lastExceptionStack = null;
-                lastException = null;
-                notifyHandlers.apply(null, [s, null].concat(args));
+              processLastException();
             }
         }
 
         var stack = TraceKit.computeStackTrace(ex);
         lastExceptionStack = stack;
         lastException = ex;
+        lastArgs = args;
 
         // If the stack trace is incomplete, wait for 2 seconds for
         // slow slow IE to see if onerror occurs or not before reporting
@@ -237,17 +251,18 @@ TraceKit.report = (function reportModuleWrapper() {
         // stack trace
         window.setTimeout(function () {
             if (lastException === ex) {
-                lastExceptionStack = null;
-                lastException = null;
-                notifyHandlers.apply(null, [stack, null].concat(args));
+                processLastException();
             }
         }, (stack.incomplete ? 2000 : 0));
 
-        throw ex; // re-throw to propagate to the top level (and cause window.onerror)
+        if (rethrow !== false) {
+            throw ex; // re-throw to propagate to the top level (and cause window.onerror)
+        }
     }
 
     report.subscribe = subscribe;
     report.unsubscribe = unsubscribe;
+    report.uninstall = unsubscribeAll;
     return report;
 }());
 
@@ -255,7 +270,6 @@ TraceKit.report = (function reportModuleWrapper() {
  * TraceKit.computeStackTrace: cross-browser stack traces in JavaScript
  *
  * Syntax:
- *   s = TraceKit.computeStackTrace.ofCaller([depth])
  *   s = TraceKit.computeStackTrace(exception) // consider using TraceKit.report instead (see below)
  * Returns:
  *   s.name              - exception name
@@ -266,7 +280,6 @@ TraceKit.report = (function reportModuleWrapper() {
  *   s.stack[i].line     - line number, if known
  *   s.stack[i].column   - column number, if known
  *   s.stack[i].context  - an array of source code lines; the middle element corresponds to the correct line#
- *   s.mode              - 'stack', 'stacktrace', 'multiline', 'callers', 'onerror', or 'failed' -- method used to collect the stack trace
  *
  * Supports:
  *   - Firefox:  full stack trace with line numbers and unreliable column
@@ -304,19 +317,6 @@ TraceKit.report = (function reportModuleWrapper() {
  * exceptions (because your catch block will likely be far away from the
  * inner function that actually caused the exception).
  *
- * Tracing example:
- *     function trace(message) {
- *         var stackInfo = TraceKit.computeStackTrace.ofCaller();
- *         var data = message + "\n";
- *         for(var i in stackInfo.stack) {
- *             var item = stackInfo.stack[i];
- *             data += (item.func || '[anonymous]') + "() in " + item.url + ":" + (item.line || '0') + "\n";
- *         }
- *         if (window.console)
- *             console.info(data);
- *         else
- *             alert(data);
- *     }
  */
 TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
     var debug = false,
@@ -333,14 +333,14 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
             return '';
         }
         try {
-            function getXHR() {
+            var getXHR = function() {
                 try {
                     return new window.XMLHttpRequest();
                 } catch (e) {
                     // explicitly bubble up the exception if not found
                     return new window.ActiveXObject('Microsoft.XMLHTTP');
                 }
-            }
+            };
 
             var request = getXHR();
             request.open('GET', url, false);
@@ -357,7 +357,8 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
      * @return {Array.<string>} Source contents.
      */
     function getSource(url) {
-        if (!_has(sourceCache, url)) {
+        if (!isString(url)) return [];
+        if (!hasKey(sourceCache, url)) {
             // URL needs to be able to fetched within the acceptable domain.  Otherwise,
             // cross-domain errors will be triggered.
             var source = '';
@@ -395,7 +396,7 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
         for (var i = 0; i < maxLines; ++i) {
             line = source[lineNo - i] + line;
 
-            if (!_isUndefined(line)) {
+            if (!isUndefined(line)) {
                 if ((m = reGuessFunction.exec(line))) {
                     return m[1];
                 } else if ((m = reFunctionArgNames.exec(line))) {
@@ -434,7 +435,7 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
         line -= 1; // convert to 0-based index
 
         for (var i = start; i < end; ++i) {
-            if (!_isUndefined(source[i])) {
+            if (!isUndefined(source[i])) {
                 context.push(source[i]);
             }
         }
@@ -598,6 +599,7 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
     // ex.message = qq is not defined
     // ex.fileName = http://...
     // ex.lineNumber = 59
+    // ex.columnNumber = 69
     // ex.stack = ...stack trace... (see the example below)
     // ex.name = ReferenceError
     //
@@ -629,8 +631,8 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
             return null;
         }
 
-        var chrome = /^\s*at (?:((?:\[object object\])?\S+) )?\(?((?:file|http|https):.*?):(\d+)(?::(\d+))?\)?\s*$/i,
-            gecko = /^\s*(\S*)(?:\((.*?)\))?@((?:file|http|https).*?):(\d+)(?::(\d+))?\s*$/i,
+        var chrome = /^\s*at (.*?) ?\(?((?:file|https?|chrome-extension):.*?):(\d+)(?::(\d+))?\)?\s*$/i,
+            gecko = /^\s*(.*?)(?:\((.*?)\))?@((?:file|https?|chrome).*?):(\d+)(?::(\d+))?\s*$/i,
             lines = ex.stack.split('\n'),
             stack = [],
             parts,
@@ -668,21 +670,24 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
             stack.push(element);
         }
 
-        if (stack[0] && stack[0].line && !stack[0].column && reference) {
-            stack[0].column = findSourceInLine(reference[1], stack[0].url, stack[0].line);
-        }
-
         if (!stack.length) {
             return null;
         }
 
+        if (stack[0].line && !stack[0].column && reference) {
+            stack[0].column = findSourceInLine(reference[1], stack[0].url, stack[0].line);
+        } else if (!stack[0].column && !isUndefined(ex.columnNumber)) {
+            // FireFox uses this awesome columnNumber property for its top frame
+            // Also note, Firefox's column number is 0-based and everything else expects 1-based,
+            // so adding 1
+            stack[0].column = ex.columnNumber + 1;
+        }
+
         return {
-            'mode': 'stack',
             'name': ex.name,
             'message': ex.message,
             'url': document.location.href,
-            'stack': stack,
-            'useragent': navigator.userAgent
+            'stack': stack
         };
     }
 
@@ -735,12 +740,10 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
         }
 
         return {
-            'mode': 'stacktrace',
             'name': ex.name,
             'message': ex.message,
             'url': document.location.href,
-            'stack': stack,
-            'useragent': navigator.userAgent
+            'stack': stack
         };
     }
 
@@ -773,8 +776,8 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
             return null;
         }
 
-        var lineRE1 = /^\s*Line (\d+) of linked script ((?:file|http|https)\S+)(?:: in function (\S+))?\s*$/i,
-            lineRE2 = /^\s*Line (\d+) of inline#(\d+) script in ((?:file|http|https)\S+)(?:: in function (\S+))?\s*$/i,
+        var lineRE1 = /^\s*Line (\d+) of linked script ((?:file|https?)\S+)(?:: in function (\S+))?\s*$/i,
+            lineRE2 = /^\s*Line (\d+) of inline#(\d+) script in ((?:file|https?)\S+)(?:: in function (\S+))?\s*$/i,
             lineRE3 = /^\s*Line (\d+) of function script\s*$/i,
             stack = [],
             scripts = document.getElementsByTagName('script'),
@@ -785,7 +788,7 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
             source;
 
         for (i in scripts) {
-            if (_has(scripts, i) && !scripts[i].src) {
+            if (hasKey(scripts, i) && !scripts[i].src) {
                 inlineScriptBlocks.push(scripts[i]);
             }
         }
@@ -847,12 +850,10 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
         }
 
         return {
-            'mode': 'multiline',
             'name': ex.name,
             'message': lines[0],
             'url': document.location.href,
-            'stack': stack,
-            'useragent': navigator.userAgent
+            'stack': stack
         };
     }
 
@@ -980,12 +981,10 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
         }
 
         var result = {
-            'mode': 'callers',
             'name': ex.name,
             'message': ex.message,
             'url': document.location.href,
-            'stack': stack,
-            'useragent': navigator.userAgent
+            'stack': stack
         };
         augmentStackTraceWithInitialElement(result, ex.sourceURL || ex.fileName, ex.line || ex.lineNumber, ex.message || ex.description);
         return result;
@@ -1047,56 +1046,16 @@ TraceKit.computeStackTrace = (function computeStackTraceWrapper() {
             }
         }
 
-        return {
-            'mode': 'failed'
-        };
-    }
-
-    /**
-     * Logs a stacktrace starting from the previous call and working down.
-     * @param {(number|string)=} depth How many frames deep to trace.
-     * @return {Object.<string, *>} Stack trace information.
-     */
-    function computeStackTraceOfCaller(depth) {
-        depth = (depth == null ? 0 : +depth) + 1; // "+ 1" because "ofCaller" should drop one frame
-        try {
-            throw new Error();
-        } catch (ex) {
-            return computeStackTrace(ex, depth + 1);
-        }
-
-        return null;
+        return {};
     }
 
     computeStackTrace.augmentStackTraceWithInitialElement = augmentStackTraceWithInitialElement;
+    computeStackTrace.computeStackTraceFromStackProp = computeStackTraceFromStackProp;
     computeStackTrace.guessFunctionName = guessFunctionName;
     computeStackTrace.gatherContext = gatherContext;
-    computeStackTrace.ofCaller = computeStackTraceOfCaller;
 
     return computeStackTrace;
 }());
-
-
-//Default options:
-if (!TraceKit.remoteFetching) {
-  TraceKit.remoteFetching = true;
-}
-if (!TraceKit.collectWindowErrors) {
-  TraceKit.collectWindowErrors = true;
-}
-if (!TraceKit.linesOfContext || TraceKit.linesOfContext < 1) {
-  // 3 lines before, the offending line, 3 lines after
-  TraceKit.linesOfContext = 7;
-}
-
-
-
-// Export to global object
-window.TraceKit = TraceKit;
-
-}(window));
-
-;(function(window, undefined){
 
 'use strict';
 
@@ -1104,8 +1063,9 @@ window.TraceKit = TraceKit;
 // If there is no JSON, we no-op the core features of Raven
 // since JSON is required to encode the payload
 var _Raven = window.Raven,
-    hasJSON = !!(window.JSON && window.JSON.stringify),
+    hasJSON = !!(typeof JSON === 'object' && JSON.stringify),
     lastCapturedException,
+    lastEventId,
     globalServer,
     globalUser,
     globalKey,
@@ -1118,13 +1078,14 @@ var _Raven = window.Raven,
         includePaths: [],
         collectWindowErrors: true,
         tags: {},
+        maxMessageLength: 100,
         extra: {}
-    };
+    },
+    authQueryString,
+    isRavenInstalled = false,
 
-var TK = TraceKit.noConflict();
-
-// Disable Tracekit's remote fetching by default
-TK.remoteFetching = false;
+    objectPrototype = Object.prototype,
+    startTime = now();
 
 /*
  * The core Raven singleton
@@ -1132,23 +1093,9 @@ TK.remoteFetching = false;
  * @this {Raven}
  */
 var Raven = {
-    VERSION: '1.1.1',
+    VERSION: '1.1.19',
 
-    // Expose TraceKit to the Raven namespace
-    TraceKit: TK,
-
-    /*
-     * Allow Raven to be configured as soon as it is loaded
-     * It uses a global RavenConfig = {dsn: '...', config: {}}
-     *
-     * @return undefined
-     */
-    afterLoad: function() {
-        var globalConfig = window.RavenConfig;
-        if (globalConfig) {
-            this.config(globalConfig.dsn, globalConfig.config).install();
-        }
-    },
+    debug: true,
 
     /*
      * Allow multiple versions of Raven to be installed.
@@ -1169,6 +1116,12 @@ var Raven = {
      * @return {Raven}
      */
     config: function(dsn, options) {
+        if (globalServer) {
+            logDebug('error', 'Error: Raven has already been configured');
+            return Raven;
+        }
+        if (!dsn) return Raven;
+
         var uri = parseDSN(dsn),
             lastSlash = uri.path.lastIndexOf('/'),
             path = uri.path.substr(1, lastSlash);
@@ -1182,8 +1135,8 @@ var Raven = {
 
         // "Script error." is hard coded into browsers for errors that it can't read.
         // this is the result of a script being pulled in from an external domain and CORS.
-        globalOptions.ignoreErrors.push('Script error.');
-        globalOptions.ignoreErrors.push('Script error');
+        globalOptions.ignoreErrors.push(/^Script error\.?$/);
+        globalOptions.ignoreErrors.push(/^Javascript error: Script error\.? on line 0$/);
 
         // join regexp rules into one big rule
         globalOptions.ignoreErrors = joinRegExp(globalOptions.ignoreErrors);
@@ -1192,7 +1145,7 @@ var Raven = {
         globalOptions.includePaths = joinRegExp(globalOptions.includePaths);
 
         globalKey = uri.user;
-        globalProject = ~~uri.path.substr(lastSlash + 1);
+        globalProject = uri.path.substr(lastSlash + 1);
 
         // assemble the endpoint from the uri pieces
         globalServer = '//' + uri.host +
@@ -1204,14 +1157,16 @@ var Raven = {
         }
 
         if (globalOptions.fetchContext) {
-            TK.remoteFetching = true;
+            TraceKit.remoteFetching = true;
         }
 
         if (globalOptions.linesOfContext) {
-            TK.linesOfContext = globalOptions.linesOfContext;
+            TraceKit.linesOfContext = globalOptions.linesOfContext;
         }
 
-        TK.collectWindowErrors = !!globalOptions.collectWindowErrors;
+        TraceKit.collectWindowErrors = !!globalOptions.collectWindowErrors;
+
+        setAuthQueryString();
 
         // return for chaining
         return Raven;
@@ -1226,9 +1181,10 @@ var Raven = {
      * @return {Raven}
      */
     install: function() {
-        if (!isSetup()) return;
-
-        TK.report.subscribe(handleStackInfo);
+        if (isSetup() && !isRavenInstalled) {
+            TraceKit.report.subscribe(handleStackInfo);
+            isRavenInstalled = true;
+        }
 
         return Raven;
     },
@@ -1283,10 +1239,13 @@ var Raven = {
         }
 
         function wrapped() {
-            var args = [], i = arguments.length;
+            var args = [], i = arguments.length,
+                deep = !options || options && options.deep !== false;
             // Recursively wrap all of a function's arguments that are
             // functions themselves.
-            while(i--) args[i] = Raven.wrap(options, arguments[i]);
+
+            while(i--) args[i] = deep ? Raven.wrap(options, arguments[i]) : arguments[i];
+
             try {
                 /*jshint -W040*/
                 return func.apply(this, args);
@@ -1298,7 +1257,7 @@ var Raven = {
 
         // copy over properties of the old function
         for (var property in func) {
-            if (func.hasOwnProperty(property)) {
+            if (hasKey(func, property)) {
                 wrapped[property] = func[property];
             }
         }
@@ -1306,6 +1265,7 @@ var Raven = {
         // Signal that this function has been wrapped already
         // for both debugging and to prevent it to being wrapped twice
         wrapped.__raven__ = true;
+        wrapped.__inner__ = func;
 
         return wrapped;
     },
@@ -1316,7 +1276,8 @@ var Raven = {
      * @return {Raven}
      */
     uninstall: function() {
-        TK.report.unsubscribe(handleStackInfo);
+        TraceKit.report.uninstall();
+        isRavenInstalled = false;
 
         return Raven;
     },
@@ -1329,8 +1290,8 @@ var Raven = {
      * @return {Raven}
      */
     captureException: function(ex, options) {
-        // If a string is passed through, recall as a message
-        if (isString(ex)) return Raven.captureMessage(ex, options);
+        // If not an Error is passed through, recall as a message instead
+        if (!isError(ex)) return Raven.captureMessage(ex, options);
 
         // Store the raw exception object for potential debugging and introspection
         lastCapturedException = ex;
@@ -1341,7 +1302,7 @@ var Raven = {
         // raises an exception different from the one we asked to
         // report on.
         try {
-            TK.report(ex, options);
+            TraceKit.report(ex, options);
         } catch(ex1) {
             if(ex !== ex1) {
                 throw ex1;
@@ -1359,10 +1320,17 @@ var Raven = {
      * @return {Raven}
      */
     captureMessage: function(msg, options) {
+        // config() automagically converts ignoreErrors from a list to a RegExp so we need to test for an
+        // early call; we'll error on the side of logging anything called before configuration since it's
+        // probably something you should see:
+        if (!!globalOptions.ignoreErrors.test && globalOptions.ignoreErrors.test(msg)) {
+            return;
+        }
+
         // Fire away!
         send(
-            arrayMerge({
-                message: msg
+            objectMerge({
+                message: msg + ''  // Make sure it's actually a string
             }, options)
         );
 
@@ -1375,10 +1343,72 @@ var Raven = {
      * @param {object} user An object representing user data [optional]
      * @return {Raven}
      */
-    setUser: function(user) {
-       globalUser = user;
+    setUserContext: function(user) {
+        globalUser = user;
 
-       return Raven;
+        return Raven;
+    },
+
+    /*
+     * Set extra attributes to be sent along with the payload.
+     *
+     * @param {object} extra An object representing extra data [optional]
+     * @return {Raven}
+     */
+    setExtraContext: function(extra) {
+        globalOptions.extra = extra || {};
+
+        return Raven;
+    },
+
+    /*
+     * Set tags to be sent along with the payload.
+     *
+     * @param {object} tags An object representing tags [optional]
+     * @return {Raven}
+     */
+    setTagsContext: function(tags) {
+        globalOptions.tags = tags || {};
+
+        return Raven;
+    },
+
+    /*
+     * Set release version of application
+     *
+     * @param {string} release Typically something like a git SHA to identify version
+     * @return {Raven}
+     */
+    setReleaseContext: function(release) {
+        globalOptions.release = release;
+
+        return Raven;
+    },
+
+    /*
+     * Set the dataCallback option
+     *
+     * @param {function} callback The callback to run which allows the
+     *                            data blob to be mutated before sending
+     * @return {Raven}
+     */
+    setDataCallback: function(callback) {
+        globalOptions.dataCallback = callback;
+
+        return Raven;
+    },
+
+    /*
+     * Set the shouldSendCallback option
+     *
+     * @param {function} callback The callback to run which allows
+     *                            introspecting the blob before sending
+     * @return {Raven}
+     */
+    setShouldSendCallback: function(callback) {
+        globalOptions.shouldSendCallback = callback;
+
+        return Raven;
     },
 
     /*
@@ -1388,8 +1418,28 @@ var Raven = {
      */
     lastException: function() {
         return lastCapturedException;
+    },
+
+    /*
+     * Get the last event id
+     *
+     * @return {string}
+     */
+    lastEventId: function() {
+        return lastEventId;
+    },
+
+    /*
+     * Determine if Raven is setup and ready to go.
+     *
+     * @return {boolean}
+     */
+    isSetup: function() {
+        return isSetup();
     }
 };
+
+Raven.setUser = Raven.setUserContext; // To be deprecated
 
 function triggerEvent(eventType, options) {
     var event, key;
@@ -1406,7 +1456,7 @@ function triggerEvent(eventType, options) {
         event.eventType = eventType;
     }
 
-    for (key in options) if (options.hasOwnProperty(key)) {
+    for (key in options) if (hasKey(options, key)) {
         event[key] = options[key];
     }
 
@@ -1422,22 +1472,36 @@ function triggerEvent(eventType, options) {
     }
 }
 
-var dsnKeys = 'source protocol user host port path'.split(' '),
-    dsnPattern = /^(?:(\w+):)?\/\/(\w+)@([\w\.-]+)(?::(\d+))?(\/.*)/;
+var dsnKeys = 'source protocol user pass host port path'.split(' '),
+    dsnPattern = /^(?:(\w+):)?\/\/(\w+)(:\w+)?@([\w\.-]+)(?::(\d+))?(\/.*)/;
+
+function RavenConfigError(message) {
+    this.name = 'RavenConfigError';
+    this.message = message;
+}
+RavenConfigError.prototype = new Error();
+RavenConfigError.prototype.constructor = RavenConfigError;
 
 /**** Private functions ****/
 function parseDSN(str) {
     var m = dsnPattern.exec(str),
         dsn = {},
-        i = 6;
+        i = 7;
 
-    while (i--) dsn[dsnKeys[i]] = m[i] || '';
+    try {
+        while (i--) dsn[dsnKeys[i]] = m[i] || '';
+    } catch(e) {
+        throw new RavenConfigError('Invalid DSN: ' + str);
+    }
+
+    if (dsn.pass)
+        throw new RavenConfigError('Do not specify your private key in the DSN!');
 
     return dsn;
 }
 
 function isUndefined(what) {
-    return typeof what === 'undefined';
+    return what === void 0;
 }
 
 function isFunction(what) {
@@ -1445,7 +1509,35 @@ function isFunction(what) {
 }
 
 function isString(what) {
-    return typeof what === 'string';
+    return objectPrototype.toString.call(what) === '[object String]';
+}
+
+function isObject(what) {
+    return typeof what === 'object' && what !== null;
+}
+
+function isEmptyObject(what) {
+    for (var k in what) return false;
+    return true;
+}
+
+// Sorta yanked from https://github.com/joyent/node/blob/aa3b4b4/lib/util.js#L560
+// with some tiny modifications
+function isError(what) {
+    return isObject(what) &&
+        objectPrototype.toString.call(what) === '[object Error]' ||
+        what instanceof Error;
+}
+
+/**
+ * hasKey, a better form of hasOwnProperty
+ * Example: hasKey(MainHostObject, property) === true/false
+ *
+ * @param {Object} host object to check property
+ * @param {string} key to check
+ */
+function hasKey(object, key) {
+    return objectPrototype.hasOwnProperty.call(object, key);
 }
 
 function each(obj, callback) {
@@ -1453,7 +1545,7 @@ function each(obj, callback) {
 
     if (isUndefined(obj.length)) {
         for (i in obj) {
-            if (obj.hasOwnProperty(i)) {
+            if (hasKey(obj, i)) {
                 callback.call(null, i, obj[i]);
             }
         }
@@ -1467,22 +1559,14 @@ function each(obj, callback) {
     }
 }
 
-var cachedAuth;
 
-function getAuthQueryString() {
-    if (cachedAuth) return cachedAuth;
-
-    var qs = [
-        'sentry_version=4',
-        'sentry_client=raven-js/' + Raven.VERSION
-    ];
-    if (globalKey) {
-        qs.push('sentry_key=' + globalKey);
-    }
-
-    cachedAuth = '?' + qs.join('&');
-    return cachedAuth;
+function setAuthQueryString() {
+    authQueryString =
+        '?sentry_version=4' +
+        '&sentry_client=raven-js/' + Raven.VERSION +
+        '&sentry_key=' + globalKey;
 }
+
 
 function handleStackInfo(stackInfo, options) {
     var frames = [];
@@ -1534,7 +1618,7 @@ function normalizeFrame(frame) {
         // Now we check for fun, if the function name is Raven or TraceKit
         /(Raven|TraceKit)\./.test(normalized['function']) ||
         // finally, we do a last ditch effort and check for raven.min.js
-        /raven\.(min\.)js$/.test(normalized.filename)
+        /raven\.(min\.)?js$/.test(normalized.filename)
     );
 
     return normalized;
@@ -1582,26 +1666,37 @@ function extractContextFromFrame(frame) {
 function processException(type, message, fileurl, lineno, frames, options) {
     var stacktrace, label, i;
 
+    // In some instances message is not actually a string, no idea why,
+    // so we want to always coerce it to one.
+    message += '';
+
     // Sometimes an exception is getting logged in Sentry as
     // <no message value>
     // This can only mean that the message was falsey since this value
     // is hardcoded into Sentry itself.
     // At this point, if the message is falsey, we bail since it's useless
-    if (!message) return;
+    if (type === 'Error' && !message) return;
 
     if (globalOptions.ignoreErrors.test(message)) return;
 
     if (frames && frames.length) {
+        fileurl = frames[0].filename || fileurl;
+        // Sentry expects frames oldest to newest
+        // and JS sends them as newest to oldest
+        frames.reverse();
         stacktrace = {frames: frames};
-        fileurl = fileurl || frames[0].filename;
     } else if (fileurl) {
         stacktrace = {
             frames: [{
                 filename: fileurl,
-                lineno: lineno
+                lineno: lineno,
+                in_app: true
             }]
         };
     }
+
+    // Truncate the message to a max of characters
+    message = truncate(message, globalOptions.maxMessageLength);
 
     if (globalOptions.ignoreUrls && globalOptions.ignoreUrls.test(fileurl)) return;
     if (globalOptions.whitelistUrls && !globalOptions.whitelistUrls.test(fileurl)) return;
@@ -1610,7 +1705,7 @@ function processException(type, message, fileurl, lineno, frames, options) {
 
     // Fire away!
     send(
-        arrayMerge({
+        objectMerge({
             // sentry.interfaces.Exception
             exception: {
                 type: type,
@@ -1624,14 +1719,22 @@ function processException(type, message, fileurl, lineno, frames, options) {
     );
 }
 
-function arrayMerge(arr1, arr2) {
-    if (!arr2) {
-        return arr1;
+function objectMerge(obj1, obj2) {
+    if (!obj2) {
+        return obj1;
     }
-    each(arr2, function(key, value){
-        arr1[key] = value;
+    each(obj2, function(key, value){
+        obj1[key] = value;
     });
-    return arr1;
+    return obj1;
+}
+
+function truncate(str, max) {
+    return str.length <= max ? str : str.substr(0, max) + '\u2026';
+}
+
+function now() {
+    return +new Date();
 }
 
 function getHttpData() {
@@ -1652,30 +1755,41 @@ function getHttpData() {
 function send(data) {
     if (!isSetup()) return;
 
-    data = arrayMerge({
+    data = objectMerge({
         project: globalProject,
         logger: globalOptions.logger,
-        site: globalOptions.site,
         platform: 'javascript',
         // sentry.interfaces.Http
         request: getHttpData()
     }, data);
 
-    // Merge in the tags and extra separately since arrayMerge doesn't handle a deep merge
-    data.tags = arrayMerge(globalOptions.tags, data.tags);
-    data.extra = arrayMerge(globalOptions.extra, data.extra);
+    // Merge in the tags and extra separately since objectMerge doesn't handle a deep merge
+    data.tags = objectMerge(objectMerge({}, globalOptions.tags), data.tags);
+    data.extra = objectMerge(objectMerge({}, globalOptions.extra), data.extra);
+
+    // Send along our own collected metadata with extra
+    data.extra = objectMerge({
+        'session:duration': now() - startTime
+    }, data.extra);
 
     // If there are no tags/extra, strip the key from the payload alltogther.
-    if (!data.tags) delete data.tags;
-    if (!data.extra) delete data.extra;
+    if (isEmptyObject(data.tags)) delete data.tags;
 
     if (globalUser) {
         // sentry.interfaces.User
         data.user = globalUser;
     }
 
+    // Include the release iff it's defined in globalOptions
+    if (globalOptions.release) data.release = globalOptions.release;
+
     if (isFunction(globalOptions.dataCallback)) {
-        data = globalOptions.dataCallback(data);
+        data = globalOptions.dataCallback(data) || data;
+    }
+
+    // Why??????????
+    if (!data || isEmptyObject(data)) {
+        return;
     }
 
     // Check if the request should be filtered or not
@@ -1683,14 +1797,20 @@ function send(data) {
         return;
     }
 
+    // Send along an event_id if not explicitly passed.
+    // This event_id can be used to reference the error within Sentry itself.
+    // Set lastEventId after we know the error should actually be sent
+    lastEventId = data.event_id || (data.event_id = uuid4());
+
     makeRequest(data);
 }
 
 
 function makeRequest(data) {
-    var img = new Image(),
-        src = globalServer + getAuthQueryString() + '&sentry_data=' + encodeURIComponent(JSON.stringify(data));
+    var img = newImage(),
+        src = globalServer + authQueryString + '&sentry_data=' + encodeURIComponent(JSON.stringify(data));
 
+    img.crossOrigin = 'anonymous';
     img.onload = function success() {
         triggerEvent('success', {
             data: data,
@@ -1706,12 +1826,17 @@ function makeRequest(data) {
     img.src = src;
 }
 
+// Note: this is shitty, but I can't figure out how to get
+// sinon to stub document.createElement without breaking everything
+// so this wrapper is just so I can stub it for tests.
+function newImage() {
+    return document.createElement('img');
+}
+
 function isSetup() {
     if (!hasJSON) return false;  // needs JSON support
     if (!globalServer) {
-        if (window.console && console.error) {
-            console.error("Error: Raven has not been configured.");
-        }
+        logDebug('error', 'Error: Raven has not been configured.');
         return false;
     }
     return true;
@@ -1720,26 +1845,65 @@ function isSetup() {
 function joinRegExp(patterns) {
     // Combine an array of regular expressions and strings into one large regexp
     // Be mad.
-    var sources = [], i = patterns.length;
-    while (i--) {
-        sources[i] = isString(patterns[i]) ?
+    var sources = [],
+        i = 0, len = patterns.length,
+        pattern;
+
+    for (; i < len; i++) {
+        pattern = patterns[i];
+        if (isString(pattern)) {
             // If it's a string, we need to escape it
             // Taken from: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_Expressions
-            patterns[i].replace(/([.*+?^=!:${}()|\[\]\/\\])/g, "\\$1") :
+            sources.push(pattern.replace(/([.*+?^=!:${}()|\[\]\/\\])/g, "\\$1"));
+        } else if (pattern && pattern.source) {
             // If it's a regexp already, we want to extract the source
-            patterns[i].source;
+            sources.push(pattern.source);
+        }
+        // Intentionally skip other cases
     }
     return new RegExp(sources.join('|'), 'i');
 }
 
-Raven.afterLoad();
-
-// Expose Raven to the world
-window.Raven = Raven;
-
-// AMD
-if (typeof define === 'function' && define.amd) {
-    define('raven', [], function() { return Raven.noConflict(); });
+// http://stackoverflow.com/questions/105034/how-to-create-a-guid-uuid-in-javascript/2117523#2117523
+function uuid4() {
+    return 'xxxxxxxxxxxx4xxxyxxxxxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        var r = Math.random()*16|0,
+            v = c == 'x' ? r : (r&0x3|0x8);
+        return v.toString(16);
+    });
 }
 
-})(window);
+function logDebug(level, message) {
+    if (window.console && console[level] && Raven.debug) {
+        console[level](message);
+    }
+}
+
+function afterLoad() {
+    // Attempt to initialize Raven on load
+    var RavenConfig = window.RavenConfig;
+    if (RavenConfig) {
+        Raven.config(RavenConfig.dsn, RavenConfig.config).install();
+    }
+}
+afterLoad();
+
+// Expose Raven to the world
+if (typeof define === 'function' && define.amd) {
+    // AMD
+    window.Raven = Raven;
+    define('raven', [], function() {
+      return Raven;
+    });
+} else if (typeof module === 'object') {
+    // browserify
+    module.exports = Raven;
+} else if (typeof exports === 'object') {
+    // CommonJS
+    exports = Raven;
+} else {
+    // Everything else
+    window.Raven = Raven;
+}
+
+})(typeof window !== 'undefined' ? window : this);
