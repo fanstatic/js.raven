@@ -4,7 +4,7 @@ CHANGES
 1.1.20 (unreleased)
 ===================
 
-- Nothing changed yet.
+- Drop json2, it is time to leave IE8 behind.
 
 
 1.1.19 (2015-08-17)

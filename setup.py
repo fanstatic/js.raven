@@ -36,7 +36,6 @@ setup(
     install_requires=[
         'fanstatic',
         'setuptools',
-        'js.json2',
         ],
     entry_points={
         'fanstatic.libraries': [
