@@ -1,7 +1,7 @@
 CHANGES
 *******
 
-1.1.20 (unreleased)
+1.1.20 (2018-01-05)
 ===================
 
 - Drop json2, it is time to leave IE8 behind.
